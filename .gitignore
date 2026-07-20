@@ -1,0 +1,5 @@
+.secrets/
+_media/
+__pycache__/
+*.pyc
+*.log
