@@ -578,18 +578,28 @@ def main() -> int:
                 note_lines.append(f"[The user sent an image via Telegram, saved at:\n{p}\n"
                                   f"Use the Read tool to view it.]")
 
-            # Document (PDF, etc.): download into the media folder under its ORIGINAL name
-            # (sanitized), so a relayed file keeps e.g. "Invoice 1101.pdf" rather than a numeric
-            # id; fall back to the update id if the name is missing/unusable.
+            # Document (PDF, etc.): keep the ORIGINAL name (sanitized) so a relayed file reads as
+            # "Invoice 1101.pdf" not a numeric id — but under a per-update-id subdir, because two
+            # files sharing a name (a second "Invoice 1101.pdf") would otherwise overwrite the
+            # first at MEDIA_DIR/<name>. The update_id is unique per message, so it cannot collide.
             if has_doc:
                 fname = doc.get("file_name") or ""
                 base = re.sub(r"[^\w .()\-]+", "_", os.path.splitext(fname)[0]).strip()
-                p = tg.download_file(doc["file_id"], MEDIA_DIR, base or stem)
+                p = tg.download_file(doc["file_id"], MEDIA_DIR / stem, base or stem)
                 if not p:
-                    tg.send(chat_id, "[bridge] Couldn't download that file. Try resending.")
-                    continue
-                note_lines.append(f"[The user sent a file ({fname or doc.get('mime_type') or 'document'}) via Telegram, saved at:\n{p}\n"
-                                  f"Use the Read tool to view it (PDFs and other documents supported).]")
+                    # Download failed — do NOT drop the message. The caption is often the actual
+                    # instruction ("here's the invoice"), so relay it with a marker rather than
+                    # letting the whole turn vanish.
+                    tg.send(chat_id, "[bridge] Couldn't download that file — relaying your text only.")
+                    if caption:
+                        note_lines.append(f"[The user sent a file ({fname or 'document'}) via Telegram "
+                                          f"with this caption, but the file download FAILED — act on "
+                                          f"the caption alone:]")
+                    else:
+                        continue
+                else:
+                    note_lines.append(f"[The user sent a file ({fname or doc.get('mime_type') or 'document'}) via Telegram, saved at:\n{p}\n"
+                                      f"Use the Read tool to view it (PDFs and other documents supported).]")
 
             # Voice: download, transcribe locally, use the transcript as the user's words.
             if has_audio:
