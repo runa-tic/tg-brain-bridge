@@ -26,6 +26,20 @@ your phone (Telegram) ──► bot long-poll ──► tg_bridge.py ──► o
   `editMessageText`, throttled under Telegram's rate limits, then finalize with proper
   formatting in place — no flicker, no message spam. If the stream path fails, it falls back
   to a plain non-streaming turn so a reply is never lost.
+- **Options as buttons.** Headless turns can't render an interactive question, so the agent
+  is told (via `--append-system-prompt`) that it can end a reply with:
+  ```
+  CHOICES: Deploy now or wait for Monday?
+  - Deploy now
+  - Wait for Monday
+  ```
+  The bridge strips that block from the answer and sends the question as a short follow-up
+  message carrying a one-time reply keyboard (up to 8 options). Tapping a button just sends
+  its label back as a normal message, so there's no callback plumbing; the next message the
+  bot sends removes the keyboard, whether you tapped or typed. (A follow-up rather than
+  buttons on the answer itself because `editMessageText` only accepts inline keyboards.)
+  The idea comes from [adx-works/vk-claude-bridge](https://github.com/adx-works/vk-claude-bridge),
+  a VK port of this repo.
 - **Voice notes** are transcribed locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
   (optional dep; everything else is stdlib).
 - **Photos and documents** (PDFs etc.) are downloaded — documents under their original

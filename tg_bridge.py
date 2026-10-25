@@ -13,7 +13,9 @@ Posture: read + write files, web research, run a whitelisted scripts dir. The ag
 NOT run arbitrary Bash. One whitelisted Telegram user only.
 
 Extras: voice notes are transcribed locally (faster-whisper, optional), and photos/PDFs
-are downloaded so the agent can Read them.
+are downloaded so the agent can Read them. When the agent wants you to pick between a few
+options, it ends its reply with a "CHOICES: <question>" block; the bridge strips it and sends
+the question as a short follow-up message with the options as tappable reply-keyboard buttons.
 
 Setup:
   1. Create a bot with @BotFather, copy the token.
@@ -65,6 +67,23 @@ CLAUDE_TIMEOUT_SEC = 900          # a single turn may take a while
 TG_LONGPOLL_SEC = 50
 TG_MAX_CHARS = 4000               # Telegram hard cap is 4096; leave headroom
 WHISPER_MODEL_SIZE = "small"      # faster-whisper model for voice transcription
+MAX_CHOICE_BUTTONS = 8
+MAX_CHOICE_LABEL = 64             # a tapped button sends its label back as the reply
+MAX_CHOICE_QUESTION = 200
+
+# Headless turns have no terminal to render an interactive question tool, so the agent is
+# taught a plain-text convention instead; the bridge turns it into buttons.
+CHOICES_SYSTEM_PROMPT = (
+    "You are being driven through a Telegram chat bridge, not the interactive CLI - there is "
+    "no terminal UI, so never call an AskUserQuestion-style tool. Instead: when you want the "
+    "user to pick from a short set of discrete options (a decision, an A/B choice, which next "
+    "step to take), end your final reply with a line 'CHOICES: <the question, one short line "
+    "naming what is being decided>', followed by each option on its own line as "
+    "'- <short option text>' (at most 8 options, a few words each). The bridge sends the "
+    "question as its own message with the options as tappable buttons, and a tap comes back "
+    "to you as the option text. Only use this for an actual choice you want tapped instead "
+    "of typed - never for ordinary lists, steps, or file listings."
+)
 
 
 # --------------------------------------------------------------------------- io
@@ -162,11 +181,47 @@ def md_to_tg_html(text: str) -> str:
     return re.sub(r"\x00(\d+)\x00", unstash, text)
 
 
+# -------------------------------------------------------------------- choices
+_CHOICES_RE = re.compile(r"(?:^|\n)[ \t]*CHOICES:[ \t]*(.*)\n((?:[ \t]*[-*][ \t]+.+(?:\n|$))+)\s*$",
+                         re.IGNORECASE)
+
+
+def split_choices(text: str) -> tuple[str, str, list[str]]:
+    """Strip a trailing 'CHOICES: <question>\\n- a\\n- b' block off the raw reply (before any
+    markdown rendering touches its '- ' lines). Returns (body, question, options); options
+    is empty when there is no block. Anchored at the end, so a CHOICES: mid-reply is text."""
+    m = _CHOICES_RE.search(text)
+    if not m:
+        return text, "", []
+    options = [re.sub(r"^[ \t]*[-*][ \t]+", "", ln).strip()[:MAX_CHOICE_LABEL]
+               for ln in m.group(2).splitlines() if ln.strip()]
+    options = [o for o in options if o][:MAX_CHOICE_BUTTONS]
+    if not options:
+        return text, "", []
+    question = m.group(1).strip()[:MAX_CHOICE_QUESTION] or "Pick one:"
+    return text[:m.start()].rstrip(), question, options
+
+
 # --------------------------------------------------------------- telegram api
 class Telegram:
     def __init__(self, token: str):
         self.base = f"https://api.telegram.org/bot{token}"
         self.file_base = f"https://api.telegram.org/file/bot{token}"
+        # A reply keyboard stays in the chat until a message removes it. Set after a CHOICES
+        # keyboard goes out; the next sendMessage carries the removal (typed answers included).
+        self.keyboard_open = False
+
+    def _with_markup(self, params: dict) -> dict:
+        if self.keyboard_open and "reply_markup" not in params:
+            params = dict(params, reply_markup=json.dumps({"remove_keyboard": True}))
+        return params
+
+    def _send_message(self, params: dict) -> dict:
+        """sendMessage that also clears a leftover CHOICES keyboard on success."""
+        res = self._call("sendMessage", self._with_markup(params))
+        if res.get("ok") and "reply_markup" not in params:
+            self.keyboard_open = False
+        return res
 
     def download_file(self, file_id: str, dest_dir: Path, stem: str) -> Path | None:
         """Resolve a Telegram file_id and download it into dest_dir/<stem><ext>."""
@@ -210,14 +265,14 @@ class Telegram:
             params = {"chat_id": chat_id, "text": md_to_tg_html(chunk),
                       "parse_mode": "HTML", "disable_web_page_preview": "true"}
             try:
-                res = self._call("sendMessage", params)
+                res = self._send_message(params)
                 if not res.get("ok"):
                     raise ValueError(res.get("description", "ok=false"))
             except Exception as e:
                 # Bad markup shouldn't drop the message: resend as plain text.
                 log(f"[warn] HTML send failed ({e}); retrying plain")
                 try:
-                    self._call("sendMessage", {"chat_id": chat_id, "text": chunk})
+                    self._send_message({"chat_id": chat_id, "text": chunk})
                 except Exception as e2:
                     log(f"[warn] plain send failed: {e2}")
 
@@ -230,19 +285,37 @@ class Telegram:
     def send_status(self, chat_id: int, text: str) -> int | None:
         """Send a plain status message and return its id (for later edit/delete)."""
         try:
-            res = self._call("sendMessage", {"chat_id": chat_id, "text": text})
+            res = self._send_message({"chat_id": chat_id, "text": text})
             if res.get("ok"):
                 return res["result"]["message_id"]
         except Exception as e:
             log(f"[warn] send_status failed: {e}")
         return None
 
+    def send_choices(self, chat_id: int, question: str, options: list[str]) -> bool:
+        """Send the question as its own message with the options as a one-time reply
+        keyboard. A tap sends the label back as an ordinary message, so the main loop needs
+        no callback handling. Falls back to a typed list if the keyboard is rejected."""
+        markup = json.dumps({"keyboard": [[{"text": o}] for o in options],
+                             "one_time_keyboard": True, "resize_keyboard": True})
+        for params in ({"chat_id": chat_id, "text": md_to_tg_html(question),
+                        "parse_mode": "HTML", "reply_markup": markup},
+                       {"chat_id": chat_id, "text": question, "reply_markup": markup}):
+            try:
+                if self._send_message(params).get("ok"):
+                    self.keyboard_open = True
+                    return True
+            except Exception as e:
+                log(f"[warn] send_choices failed: {e}")
+        self.send(chat_id, question + "\n" + "\n".join(f"- {o}" for o in options))
+        return False
+
     def send_html(self, chat_id: int, html_text: str) -> int | None:
         """Send a pre-rendered HTML message (live preview); return its id."""
         try:
-            res = self._call("sendMessage",
-                             {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML",
-                              "disable_web_page_preview": "true"})
+            res = self._send_message(
+                {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML",
+                 "disable_web_page_preview": "true"})
             if res.get("ok"):
                 return res["result"]["message_id"]
         except Exception as e:
@@ -289,7 +362,8 @@ class Telegram:
 def run_claude(claude: str, message: str, session_id: str | None) -> tuple[str, str | None]:
     """Run one headless turn. Returns (reply_text, new_session_id)."""
     cmd = [claude, "-p", "--output-format", "json",
-           "--permission-mode", PERMISSION_MODE, "--allowedTools", *ALLOWED_TOOLS]
+           "--permission-mode", PERMISSION_MODE, "--allowedTools", *ALLOWED_TOOLS,
+           "--append-system-prompt", CHOICES_SYSTEM_PROMPT]
     if session_id:
         cmd += ["--resume", session_id]
     else:
@@ -324,13 +398,22 @@ def run_claude(claude: str, message: str, session_id: str | None) -> tuple[str, 
 
 def _deliver(tg, chat_id, bubble_id, text: str) -> None:
     """Turn the live preview bubble into the final, properly formatted answer.
-    In-place HTML edit for single-message replies (no flicker); else delete + send."""
-    if bubble_id is not None and len(text) <= TG_MAX_CHARS and tg.edit_message_html(
+    In-place HTML edit for single-message replies (no flicker); else delete + send.
+    A trailing CHOICES: block is stripped and follows as its own question + buttons message
+    (editMessageText can only carry inline keyboards, so it can't ride on the bubble)."""
+    text, question, options = split_choices(text)
+    if not text.strip() and options:   # reply was nothing but the choice
+        if bubble_id is not None:
+            tg.delete_message(chat_id, bubble_id)
+    elif bubble_id is not None and len(text) <= TG_MAX_CHARS and tg.edit_message_html(
             chat_id, bubble_id, text):
-        return
-    if bubble_id is not None:
-        tg.delete_message(chat_id, bubble_id)
-    tg.send(chat_id, text)
+        pass
+    else:
+        if bubble_id is not None:
+            tg.delete_message(chat_id, bubble_id)
+        tg.send(chat_id, text)
+    if options:
+        tg.send_choices(chat_id, question, options)
 
 
 def tool_summary(name, inp):
@@ -366,7 +449,8 @@ def run_claude_streaming(tg, chat_id, claude, message, session_id):
     Best-effort: the live view is a bonus, but if the stream fails to produce an
     answer we fall back to the proven non-streaming run_claude so a reply is never lost."""
     cmd = [claude, "-p", "--output-format", "stream-json", "--include-partial-messages",
-           "--verbose", "--permission-mode", PERMISSION_MODE, "--allowedTools", *ALLOWED_TOOLS]
+           "--verbose", "--permission-mode", PERMISSION_MODE, "--allowedTools", *ALLOWED_TOOLS,
+           "--append-system-prompt", CHOICES_SYSTEM_PROMPT]
     if session_id:
         cmd += ["--resume", session_id]
     else:
@@ -488,7 +572,7 @@ def run_claude_streaming(tg, chat_id, claude, message, session_id):
         reply, sid = run_claude(claude, message, session_id)
         if reply == "__RESET__":
             return (None, True)
-        tg.send(chat_id, reply)
+        _deliver(tg, chat_id, None, reply)
         return (sid, False)
 
     _deliver(tg, chat_id, bubble_id, final or "(no output)")
